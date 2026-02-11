@@ -1114,13 +1114,14 @@ function formatClientName(u) {
   return name || (u.username ? `@${u.username}` : `id:${u.tg_id}`);
 }
 
-async function renderAdminClients(ctx, mode = "edit") {
+async function renderAdminClients(ctx, mode = "edit", page = 1) {
+  const PAGE_SIZE = 8;
   const users = db.prepare(`
     SELECT tg_id, username, first_name, last_name, status, device_limit, devices_used, expires_at, updated_at
     FROM users
     WHERE status='approved'
     ORDER BY updated_at DESC
-    LIMIT 100
+    LIMIT 200
   `).all();
 
   const active = users.filter(u => !u.expires_at || u.expires_at > now());
@@ -1136,25 +1137,31 @@ async function renderAdminClients(ctx, mode = "edit") {
     return safeEditMessageText(ctx, text, { reply_markup: adminMainMenu().reply_markup });
   }
 
-  const rows = [];
-  for (const u of users) {
+  const totalPages = Math.max(1, Math.ceil(users.length / PAGE_SIZE));
+  const safePage = Math.min(totalPages, Math.max(1, Number(page) || 1));
+  const start = (safePage - 1) * PAGE_SIZE;
+  const pageUsers = users.slice(start, start + PAGE_SIZE);
+
+  text += `Страница ${safePage}/${totalPages}\n\n`;
+
+  for (const u of pageUsers) {
     const isActive = !u.expires_at || u.expires_at > now();
     const icon = isActive ? "✅" : "⌛";
-    const username = u.username ? `@${u.username}` : "без username";
+    const username = u.username ? `@${u.username}` : `id:${u.tg_id}`;
     const expText = u.expires_at ? new Date(u.expires_at * 1000).toLocaleDateString('ru-RU') : "без срока";
     const limText = u.device_limit === 0 ? "∞" : String(u.device_limit || 0);
 
     text += `${icon} ${formatClientName(u)} (${username})\n`;
     text += `   устр: ${u.devices_used}/${limText} • срок: ${expText}\n`;
-
-    if (u.username) {
-      rows.push([Markup.button.url(`${icon} ${username}`, `https://t.me/${u.username}`)]);
-    } else {
-      rows.push([Markup.button.url(`${icon} id:${u.tg_id}`, `tg://user?id=${u.tg_id}`)]);
-    }
   }
 
-  rows.push([Markup.button.callback("🔄 Обновить", "admin_clients")]);
+  const rows = [];
+  const nav = [];
+  if (safePage > 1) nav.push(Markup.button.callback("⬅️ Назад", `admin_clients_page:${safePage - 1}`));
+  if (safePage < totalPages) nav.push(Markup.button.callback("Вперёд ➡️", `admin_clients_page:${safePage + 1}`));
+  if (nav.length) rows.push(nav);
+
+  rows.push([Markup.button.callback("🔄 Обновить", `admin_clients_page:${safePage}`)]);
   rows.push([Markup.button.callback("« В меню", "admin_menu")]);
 
   if (mode === "reply") {
@@ -1227,7 +1234,14 @@ bot.action("admin_stats_users", async (ctx) => {
 bot.action("admin_clients", async (ctx) => {
   if (!requireAdmin(ctx)) return;
   await safeAnswerCbQuery(ctx);
-  await renderAdminClients(ctx, "edit");
+  await renderAdminClients(ctx, "edit", 1);
+});
+
+bot.action(/admin_clients_page:(\d+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const page = Number(ctx.match[1] || 1);
+  await safeAnswerCbQuery(ctx);
+  await renderAdminClients(ctx, "edit", page);
 });
 
 // ==================== COMMANDS ====================
