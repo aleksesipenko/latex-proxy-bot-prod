@@ -518,12 +518,15 @@ bot.start(async (ctx) => {
   const kb = userMenu({ approved });
   
   if (isAdmin) {
-    return await ctx.reply(startText, {
-      reply_markup: {
-        ...kb.reply_markup,
-        ...ADMIN_REPLY_KEYBOARD.reply_markup
-      },
-      parse_mode: "HTML"
+    // 1. Send persistent Reply Keyboard (bottom menu)
+    await ctx.reply("🔧 Админ-панель активна", {
+      reply_markup: ADMIN_REPLY_KEYBOARD.reply_markup
+    });
+
+    // 2. Send the standard inline menu
+    return await renderMenu(ctx, {
+      text: startText,
+      keyboard: kb
     });
   }
 
