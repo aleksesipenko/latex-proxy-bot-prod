@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS user_ps_state (
+  tg_id INTEGER NOT NULL,
+  stage TEXT NOT NULL,
+  last_idx INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (tg_id, stage)
+);
 `);
 
 // lightweight migrations
@@ -131,33 +139,32 @@ const PS = {
     "P.S. Ничего незаконного. Просто стабильность.",
     "P.S. Если ты это читаешь — значит, ты из тех, кто выбирает рабочие решения. Уважаю."
   ],
-  requestSent: [
-    "P.S. Я уже увидела заявку. Да, я быстрая. Не задавай вопросов 🙂",
-    "P.S. Не переживай, я не потеряю тебя в очереди. Я же не госуслуги.",
-    "P.S. Пока ждёшь — где‑то один фильтр грустит. Совсем чуть‑чуть.",
-    "P.S. Нажал кнопку — значит, ты в теме.",
-    "P.S. Если что, я тут. Я не исчезаю."
-  ],
-  accessGranted: [
-    "P.S. Нажми кнопку — и дальше всё сделает Telegram. Красиво. Почти как будто так и должно быть.",
-    "P.S. Если что-то не грузит — это не ты. Это… «атмосфера» 😌",
-    "P.S. Я бы сказала «добро пожаловать», но мы тут не клуб. Мы тут за стабильность.",
-    "P.S. Иногда свобода выглядит как нормальная загрузка сообщений.",
-    "P.S. Ты это не видел. Я это не писала 😉"
-  ],
-  howto: [
-    "P.S. Да, это выглядит как «три шага». На самом деле это ритуал изгнания лагов.",
-    "P.S. Если ты читаешь это — значит кнопка не открылась. Мы с тобой в одной команде.",
-    "P.S. Спасибо, что следуешь инструкции. Я старалась писать её так, чтобы не бесить.",
-    "P.S. Да, я тоже люблю, когда всё работает с первого раза. Но мир не всегда согласен.",
-    "P.S. Если совсем беда — просто напиши «Не работает», я пойму."
+  end: [
+    "Мы только что сделали ваш интернет чуточку свободнее",
+    "Готово. Мы только что сделали ваш интернет чуточку свободнее",
+    "Подключение завершено. Мы только что сделали ваш интернет чуточку свободнее"
   ]
 };
 
-function pickPs(stage, seed) {
+function pickUniquePs(stage, tgId) {
   const arr = PS[stage] || [];
   if (!arr.length) return "";
-  const idx = Math.abs((seed * 9301 + 49297) % 233280) % arr.length;
+
+  const row = db.prepare("SELECT last_idx FROM user_ps_state WHERE tg_id=? AND stage=?").get(tgId, stage);
+  let idx = Math.floor(Math.random() * arr.length);
+
+  if (arr.length > 1 && row && idx === row.last_idx) {
+    idx = (idx + 1) % arr.length;
+  }
+
+  db.prepare(`
+    INSERT INTO user_ps_state(tg_id, stage, last_idx, updated_at)
+    VALUES(?, ?, ?, ?)
+    ON CONFLICT(tg_id, stage) DO UPDATE SET
+      last_idx=excluded.last_idx,
+      updated_at=excluded.updated_at
+  `).run(tgId, stage, idx, now());
+
   return arr[idx];
 }
 
@@ -314,7 +321,11 @@ function userMenu(opts = {}) {
   if (!approved) {
     rows.push([Markup.button.callback("Запросить доступ", "req_access")]);
   } else {
-    rows.push([Markup.button.callback("Получить прокси", "get_proxy")]);
+    rows.push([
+      Markup.button.callback("⚡ TURBO", "get_turbo"),
+      Markup.button.callback("🧱 STABLE", "get_stable")
+    ]);
+    rows.push([Markup.button.callback("🛡️ Оба профиля", "get_profiles")]);
     rows.push([Markup.button.callback("Инструкция", "howto")]);
   }
   return Markup.inlineKeyboard(rows);
@@ -336,8 +347,9 @@ function adminRequestListItem(reqId, userSummary) {
 
 function adminRequestCard(reqId) {
   return Markup.inlineKeyboard([
+    [Markup.button.callback("⚡ Быстро выдать (5 устр / без срока)", `admin_quickgrant:${reqId}`)],
     [
-      Markup.button.callback("✅ Одобрить", `admin_approve:${reqId}`),
+      Markup.button.callback("✅ Одобрить (кастом)", `admin_approve:${reqId}`),
       Markup.button.callback("❌ Отказать", `admin_deny:${reqId}`)
     ],
     [
@@ -497,16 +509,12 @@ bot.start(async (ctx) => {
 
   const approved = isApproved(u);
 
+  const startText = approved
+    ? `Привет! Доступ уже активен ✅\n\nВыбери режим:\n• ⚡ TURBO — быстрее\n• 🧱 STABLE — надёжнее при плохом маршруте\n\n${pickUniquePs("start", ctx.from.id)}`
+    : `Привет! Я помогаю подключиться к прокси, чтобы связь работала стабильно.\n\nКак это работает:\n1) Нажми «Запросить доступ»\n2) Я подтвержу\n\n⚠️ Важно: С включённым VPN MTProto‑прокси часто не работает.\n\n${pickUniquePs("start", ctx.from.id)}`;
+
   await renderMenu(ctx, {
-    text: `Привет! Я помогаю подключиться к прокси, чтобы связь работала стабильно.
-
-Как это работает:
-1) Нажми «Запросить доступ»
-2) Я подтвержу
-
-⚠️ Важно: С включённым VPN MTProto‑прокси часто не работает.
-
-${pickPs("start", ctx.from.id)}`,
+    text: startText,
     keyboard: userMenu({ approved })
   });
 });
@@ -536,7 +544,7 @@ bot.action("req_access", async (ctx) => {
     );
 
     return renderMenu(ctx, {
-      text: `Заявка уже отправлена и ожидает проверки ⏳\n\nЯ повторно пинганула админа по твоей заявке ✅\n\n${pickPs("requestSent", ctx.from.id)}`,
+      text: `Заявка уже отправлена и ожидает проверки ⏳\n\nЯ повторно пинганула админа по твоей заявке ✅`,
       keyboard: userMenu({ approved: false })
     });
   }
@@ -547,9 +555,7 @@ bot.action("req_access", async (ctx) => {
 
   await safeAnswerCbQuery(ctx, "Отправлено");
   await renderMenu(ctx, {
-    text: `Заявка отправлена ✅
-
-${pickPs("requestSent", ctx.from.id)}`,
+    text: `Заявка отправлена ✅\n\nКак только одобрю — сразу открою тебе нужные кнопки подключения.`,
     keyboard: userMenu({ approved: false })
   });
 
@@ -557,50 +563,65 @@ ${pickPs("requestSent", ctx.from.id)}`,
   await safeSendMessage(bot, ADMIN_ID, `🆕 Новая заявка на доступ\n${fmtUser(nu)}`, adminMainMenu());
 });
 
-bot.action("get_proxy", async (ctx) => {
+bot.action(/get_proxy|get_profiles|get_turbo|get_stable/, async (ctx) => {
   upsertUser(ctx.from);
   const u = getUser(ctx.from.id);
   if (!isApproved(u)) {
     return safeAnswerCbQuery(ctx, "Нет доступа (или истёк)", { show_alert: true });
   }
 
-  const url = (ctx.from.id === ADMIN_ID) ? adminProxyUrl() : proxyUrl();
-  if (!url) {
+  if (!PROXY_SECRET) {
     return safeAnswerCbQuery(ctx, "Прокси временно недоступен (секрет не задан)", { show_alert: true });
   }
 
   if (ctx.from.id !== ADMIN_ID && u.device_limit > 0 && u.devices_used >= u.device_limit) {
     return safeAnswerCbQuery(ctx, "Лимит устройств исчерпан. Попроси апдейт", { show_alert: true });
   }
-  if (ctx.from.id !== ADMIN_ID && u.devices_used == 0) {
+  if (ctx.from.id !== ADMIN_ID && u.devices_used === 0) {
     db.prepare("UPDATE users SET devices_used = devices_used + 1, updated_at=? WHERE tg_id=?").run(now(), u.tg_id);
   }
 
+  const { turboUrl, stableUrl } = buildProxyUrls();
+  const action = ctx.match?.[0] || ctx.callbackQuery?.data || "get_profiles";
+
+  let text = "";
+  let keyboard;
+
+  if (action === "get_turbo") {
+    text = `⚡ TURBO профиль\n\nНажми кнопку ниже для подключения\n\nМы только что сделали ваш интернет чуточку свободнее`;
+    keyboard = Markup.inlineKeyboard([[Markup.button.url("Подключить TURBO", turboUrl)], [Markup.button.callback("Показать оба профиля", "get_profiles")]]);
+  } else if (action === "get_stable") {
+    text = `🧱 STABLE профиль\n\nНажми кнопку ниже для подключения\n\nМы только что сделали ваш интернет чуточку свободнее`;
+    keyboard = Markup.inlineKeyboard([[Markup.button.url("Подключить STABLE", stableUrl)], [Markup.button.callback("Показать оба профиля", "get_profiles")]]);
+  } else {
+    text = `Доступ активен ✅\n\nВыбери режим подключения:\n• TURBO — быстрее\n• STABLE — надёжнее при плохом маршруте\n\nМы только что сделали ваш интернет чуточку свободнее`;
+    keyboard = Markup.inlineKeyboard([
+      [Markup.button.url("⚡ Подключить TURBO", turboUrl)],
+      [Markup.button.url("🧱 Подключить STABLE", stableUrl)],
+      [Markup.button.callback("Какой выбрать?", "howto")]
+    ]);
+  }
+
   await safeAnswerCbQuery(ctx, "Ок");
-
-  await renderMenu(ctx, {
-    text: `Доступ активен ✅
-
-Нажми кнопку ниже — Telegram откроет окно добавления прокси.
-
-⚠️ Если у тебя включён VPN и ничего не грузит — выключи VPN и включи прокси заново.
-
-${pickPs("accessGranted", ctx.from.id)}`,
-    keyboard: Markup.inlineKeyboard([[Markup.button.url("Подключить прокси", url)]])
-  });
+  await renderMenu(ctx, { text, keyboard });
 });
 
 bot.action("howto", async (ctx) => {
   await safeAnswerCbQuery(ctx);
+  const approved = isApproved(getUser(ctx.from.id));
   await renderMenu(ctx, {
-    text: `Как включить прокси вручную:
+    text: `Как выбрать режим:
 
+• TURBO — используй первым (быстрее)
+• STABLE — если видео/медиа лагают или не открываются
+
+Ручное подключение:
 1) Telegram → Настройки → Данные и память → Прокси
 2) «Добавить прокси» → MTProto
 3) Вставь Server / Port / Secret
 
-${pickPs("howto", ctx.from.id)}`,
-    keyboard: userMenu({ approved: isApproved(getUser(ctx.from.id)) })
+После включения прокси отключи внешний VPN, если он мешает.` ,
+    keyboard: userMenu({ approved })
   });
 });
 
@@ -769,6 +790,41 @@ bot.action(/admin_view_req:(.+)/, async (ctx) => {
   }
 });
 
+// Quick grant default profile (5 devices, unlimited)
+bot.action(/admin_quickgrant:(.+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const reqId = ctx.match[1];
+
+  const req = db.prepare("SELECT * FROM requests WHERE id=?").get(reqId);
+  if (!req || req.status !== "pending") {
+    deleteAdminSession(reqId);
+    return safeAnswerCbQuery(ctx, "Уже обработано");
+  }
+
+  const deviceLimit = 5;
+  const expiresDays = 0;
+  const expiresAt = null;
+
+  db.prepare("UPDATE requests SET status='approved' WHERE id=?").run(reqId);
+  setUserAccess(req.tg_id, { deviceLimit, expiresAt });
+  deleteAdminSession(reqId);
+
+  await safeAnswerCbQuery(ctx, "Выдано: 5 устройств, без срока");
+  await safeEditMessageText(ctx,
+    `✅ Доступ выдан быстро\n\n📱 Лимит: 5\n📅 Срок: без ограничений`,
+    { reply_markup: adminMainMenu().reply_markup }
+  );
+
+  await safeSendMessage(bot, req.tg_id,
+    `Доступ выдан ✅\nЛимит устройств: 5\nСрок: без ограничений\n\n${pickUniquePs("end", req.tg_id)}`
+  );
+
+  await renderMenuForUser(req.tg_id, {
+    text: `Привет! Доступ активен ✅\n\nВыбери нужный режим подключения ниже.\n\n${pickUniquePs("start", req.tg_id)}`,
+    keyboard: userMenu({ approved: true })
+  });
+});
+
 // Start approve flow from admin panel
 bot.action(/admin_approve:(.+)/, async (ctx) => {
   if (!requireAdmin(ctx)) return;
@@ -779,7 +835,7 @@ bot.action(/admin_approve:(.+)/, async (ctx) => {
     return safeAnswerCbQuery(ctx, "Уже обработано или не найдено");
   }
   
-  createAdminSession(reqId, ctx.from.id, 2, 30);
+  createAdminSession(reqId, ctx.from.id, 5, 0);
   
   await safeAnswerCbQuery(ctx, "Начинаем настройку");
   await safeEditMessageText(ctx,
@@ -886,11 +942,11 @@ bot.action(/admin_confirm:(.+)/, async (ctx) => {
   );
   
   await safeSendMessage(bot, req.tg_id,
-    `Доступ выдан ✅\nЛимит устройств: ${deviceLimit === 0 ? '∞' : deviceLimit}\nСрок: ${expText}\n\n${pickPs("accessGranted", req.tg_id)}`
+    `Доступ выдан ✅\nЛимит устройств: ${deviceLimit === 0 ? '∞' : deviceLimit}\nСрок: ${expText}\n\n${pickUniquePs("end", req.tg_id)}`
   );
   
   await renderMenuForUser(req.tg_id, {
-    text: `Привет! Доступ активен ✅\n\n⚠️ Важно: С включённым VPN MTProto‑прокси часто не работает.\n\n${pickPs("start", req.tg_id)}`,
+    text: `Привет! Доступ активен ✅\n\nВыбери нужный режим подключения ниже.\n\n${pickUniquePs("start", req.tg_id)}`,
     keyboard: userMenu({ approved: true })
   });
 });
@@ -1067,8 +1123,48 @@ bot.action("admin_stats", async (ctx) => {
   const expiringSoon = db.prepare("SELECT COUNT(*) as count FROM users WHERE status='approved' AND expires_at > ? AND expires_at < ?").get(now(), weekFromNow).count;
   
   const text = `📊 Статистика:\n\n👥 Всего пользователей: ${total}\n✅ Активных доступов: ${approved}\n⏳ Ожидают проверки: ${pending}\n❌ Отклонено: ${denied}\n🚫 Забанено: ${banned}\n\n⚠️ Истекает в течение 7 дней: ${expiringSoon}`;
+
+  const keyboard = Markup.inlineKeyboard([
+    [Markup.button.callback("👥 Юзернеймы и профили", "admin_stats_users")],
+    [Markup.button.callback("« В меню", "admin_menu")]
+  ]);
   
-  await safeEditMessageText(ctx, text, { reply_markup: adminMainMenu().reply_markup });
+  await safeEditMessageText(ctx, text, { reply_markup: keyboard.reply_markup });
+});
+
+bot.action("admin_stats_users", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await safeAnswerCbQuery(ctx);
+
+  const users = db.prepare(`
+    SELECT tg_id, username, first_name, last_name, status
+    FROM users
+    ORDER BY updated_at DESC
+    LIMIT 80
+  `).all();
+
+  if (!users.length) {
+    return safeEditMessageText(ctx, "Пользователи пока не найдены", { reply_markup: adminMainMenu().reply_markup });
+  }
+
+  let text = `👥 Пользователи (последние ${users.length})\nНажми кнопку — откроется профиль в Telegram\n\n`;
+  const rows = [];
+
+  for (const u of users) {
+    const name = `${u.first_name || ""} ${u.last_name || ""}`.trim() || `id:${u.tg_id}`;
+    const username = u.username ? `@${u.username}` : "без username";
+    const emoji = u.status === 'approved' ? '✅' : (u.status === 'pending' ? '⏳' : '•');
+    text += `${emoji} ${name} (${username})\n`;
+
+    if (u.username) {
+      rows.push([Markup.button.url(`${emoji} ${username}`, `https://t.me/${u.username}`)]);
+    } else {
+      rows.push([Markup.button.url(`${emoji} ${name}`, `tg://user?id=${u.tg_id}`)]);
+    }
+  }
+
+  rows.push([Markup.button.callback("« Назад к статистике", "admin_stats")]);
+  await safeEditMessageText(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
 });
 
 // ==================== COMMANDS ====================
