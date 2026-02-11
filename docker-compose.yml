@@ -1,0 +1,11 @@
+services:
+  bot:
+    image: node:20-alpine
+    working_dir: /app
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app
+      - ./data:/data
+    command: sh -lc "npm ci --omit=dev || npm i --omit=dev; node index.js"

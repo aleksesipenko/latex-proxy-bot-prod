@@ -1,0 +1,366 @@
+import { Telegraf, Markup } from "telegraf";
+import Database from "better-sqlite3";
+import crypto from "crypto";
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = Number(process.env.ADMIN_ID);
+
+const PROXY_SERVER = process.env.PROXY_SERVER || "45.140.146.233";
+const PROXY_PORT = process.env.PROXY_PORT || "443";
+const PROXY_SECRET = process.env.PROXY_SECRET || "";
+
+if (!BOT_TOKEN) throw new Error("BOT_TOKEN missing");
+if (!ADMIN_ID) throw new Error("ADMIN_ID missing");
+
+const db = new Database("/data/bot.db");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  tg_id INTEGER PRIMARY KEY,
+  username TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  status TEXT NOT NULL DEFAULT new,
+  device_limit INTEGER DEFAULT 0,
+  devices_used INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER DEFAULT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  menu_msg_id INTEGER DEFAULT NULL
+);
+
+CREATE TABLE IF NOT EXISTS requests (
+  id TEXT PRIMARY KEY,
+  tg_id INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`);
+
+
+// lightweight migration (ignore if column already exists)
+try {
+  db.prepare("ALTER TABLE users ADD COLUMN menu_msg_id INTEGER").run();
+} catch {}
+
+const now = () => Math.floor(Date.now() / 1000);
+
+
+const PS = {
+  start: [
+    "P.S. Если связь вдруг «случайно» стала капризной — у нас есть свои маленькие лайфхаки 😉",
+    "P.S. Тут всё максимально просто. Даже если миру вокруг нравится усложнять.",
+    "P.S. Я не спорю с реальностью. Я просто делаю так, чтобы она работала.",
+    "P.S. Ничего незаконного. Просто стабильность.",
+    "P.S. Если ты это читаешь — значит, ты из тех, кто выбирает рабочие решения. Уважаю."
+  ],
+  requestSent: [
+    "P.S. Я уже увидела заявку. Да, я быстрая. Не задавай вопросов 🙂",
+    "P.S. Не переживай, я не потеряю тебя в очереди. Я же не госуслуги.",
+    "P.S. Пока ждёшь — где‑то один фильтр грустит. Совсем чуть‑чуть.",
+    "P.S. Нажал кнопку — значит, ты в теме.",
+    "P.S. Если что, я тут. Я не исчезаю."
+  ],
+  accessGranted: [
+    "P.S. Нажми кнопку — и дальше всё сделает Telegram. Красиво. Почти как будто так и должно быть.",
+    "P.S. Если что-то не грузит — это не ты. Это… «атмосфера» 😌",
+    "P.S. Я бы сказала «добро пожаловать», но мы тут не клуб. Мы тут за стабильность.",
+    "P.S. Иногда свобода выглядит как нормальная загрузка сообщений.",
+    "P.S. Ты это не видел. Я это не писала 😉"
+  ],
+  howto: [
+    "P.S. Да, это выглядит как «три шага». На самом деле это ритуал изгнания лагов.",
+    "P.S. Если ты читаешь это — значит кнопка не открылась. Мы с тобой в одной команде.",
+    "P.S. Спасибо, что следуешь инструкции. Я старалась писать её так, чтобы не бесить.",
+    "P.S. Да, я тоже люблю, когда всё работает с первого раза. Но мир не всегда согласен.",
+    "P.S. Если совсем беда — просто напиши «Не работает», я пойму."
+  ]
+};
+
+function pickPs(stage, seed) {
+  const arr = PS[stage] || [];
+  if (!arr.length) return "";
+  const idx = Math.abs((seed * 9301 + 49297) % 233280) % arr.length;
+  return arr[idx];
+}
+
+async function renderMenu(ctx, { text, keyboard }) {
+  const userId = ctx.from.id;
+  const u = getUser(userId);
+  const chatId = (ctx.chat && ctx.chat.id) ? ctx.chat.id : userId;
+
+  if (u && u.menu_msg_id) {
+    try {
+      await ctx.telegram.editMessageText(chatId, u.menu_msg_id, undefined, text, {
+        reply_markup: keyboard.reply_markup,
+      });
+      return u.menu_msg_id;
+    } catch (e) {
+      try { await ctx.telegram.deleteMessage(chatId, u.menu_msg_id); } catch {}
+    }
+  }
+
+  const sent = await ctx.telegram.sendMessage(chatId, text, keyboard);
+  db.prepare("UPDATE users SET menu_msg_id=?, updated_at=? WHERE tg_id=?").run(sent.message_id, now(), userId);
+  return sent.message_id;
+}
+
+
+function upsertUser(from) {
+  const t = now();
+  db.prepare(`
+    INSERT INTO users(tg_id, username, first_name, last_name, status, created_at, updated_at)
+    VALUES(?,?,?,?, 'new', ?,?)
+    ON CONFLICT(tg_id) DO UPDATE SET
+      username=excluded.username,
+      first_name=excluded.first_name,
+      last_name=excluded.last_name,
+      updated_at=excluded.updated_at
+  `).run(from.id, from.username || null, from.first_name || null, from.last_name || null, t, t);
+}
+
+function getUser(tgId) {
+  return db.prepare("SELECT * FROM users WHERE tg_id=?").get(tgId);
+}
+
+function setUserStatus(tgId, status) {
+  db.prepare("UPDATE users SET status=?, updated_at=? WHERE tg_id=?").run(status, now(), tgId);
+}
+
+function setUserAccess(tgId, { deviceLimit, expiresAt }) {
+  db.prepare("UPDATE users SET status=approved, device_limit=?, expires_at=?, updated_at=? WHERE tg_id=?")
+    .run(deviceLimit, expiresAt ?? null, now(), tgId);
+}
+
+function revokeUser(tgId) {
+  db.prepare("UPDATE users SET status=revoked, updated_at=? WHERE tg_id=?").run(now(), tgId);
+}
+
+function banUser(tgId) {
+  db.prepare("UPDATE users SET status=banned, updated_at=? WHERE tg_id=?").run(now(), tgId);
+}
+
+function fmtUser(u) {
+  const uname = u.username ? `@${u.username}` : "(no username)";
+  const name = `${u.first_name || ""} ${u.last_name || ""}`.trim();
+  return `${name} ${uname} | id:${u.tg_id}`;
+}
+
+function isApproved(u) {
+  if (!u) return false;
+  if (u.status !== "approved") return false;
+  if (u.expires_at && now() > u.expires_at) return false;
+  return true;
+}
+
+function proxyUrl() {
+  const secret = PROXY_SECRET;
+  if (!secret) return null;
+  return `https://t.me/proxy?server=${PROXY_SERVER}&port=${PROXY_PORT}&secret=${secret}`;
+}
+
+function requireAdmin(ctx) {
+  if (ctx.from?.id !== ADMIN_ID) {
+    ctx.reply("Нет доступа");
+    return false;
+  }
+  return true;
+}
+
+function userMenu(opts = {}) {
+  const { approved = false } = opts;
+  const rows = [];
+  if (!approved) {
+    rows.push([Markup.button.callback("Запросить доступ", "req_access")]);
+  } else {
+    rows.push([Markup.button.callback("Получить прокси", "get_proxy")]);
+    rows.push([Markup.button.callback("Инструкция", "howto")]);
+  }
+  return Markup.inlineKeyboard(rows);
+}
+
+function adminReqCard(reqId) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("✅ Принять", `approve:${reqId}`), Markup.button.callback("❌ Отказать", `deny:${reqId}`)],
+    [Markup.button.callback("🧱 Бан", `banreq:${reqId}`)]
+  ]);
+}
+
+function adminAccessPicker(reqId) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("1 устройство", `setdev:${reqId}:1`), Markup.button.callback("2", `setdev:${reqId}:2`), Markup.button.callback("3", `setdev:${reqId}:3`), Markup.button.callback("5", `setdev:${reqId}:5`)],
+    [Markup.button.callback("7 дней", `setexp:${reqId}:7`), Markup.button.callback("30 дней", `setexp:${reqId}:30`), Markup.button.callback("Без срока", `setexp:${reqId}:0`)]
+  ]);
+}
+
+const bot = new Telegraf(BOT_TOKEN);
+
+bot.start(async (ctx) => {
+  upsertUser(ctx.from);
+  const u = getUser(ctx.from.id);
+  if (u?.status === "banned") return ctx.reply("Доступ закрыт");
+
+  const approved = isApproved(u);
+
+  await renderMenu(ctx, {
+    text: `Привет! Я помогаю подключиться к прокси, чтобы связь работала стабильно.
+
+Как это работает:
+1) Нажми «Запросить доступ»
+2) Я подтвержу
+
+⚠️ Важно: С включённым VPN MTProto‑прокси часто не работает.
+
+${pickPs("start", ctx.from.id)}`,
+    keyboard: userMenu({ approved })
+  });
+});
+
+bot.action("req_access", async (ctx) => {
+  upsertUser(ctx.from);
+  const u = getUser(ctx.from.id);
+  if (u.status === "banned") return ctx.answerCbQuery("Доступ закрыт", { show_alert: true });
+  if (u.status === "approved" && isApproved(u)) return ctx.answerCbQuery("У тебя уже есть доступ");
+
+  const reqId = crypto.randomUUID();
+  db.prepare("INSERT INTO requests(id,tg_id,status,created_at) VALUES(?,?, 'pending', ?)").run(reqId, ctx.from.id, now());
+  setUserStatus(ctx.from.id, "pending");
+
+  await ctx.answerCbQuery("Отправлено");
+  await renderMenu(ctx, {
+  text: `Заявка отправлена ✅
+
+${pickPs("requestSent", ctx.from.id)}`,
+  keyboard: userMenu({ approved: false })
+});
+
+  const nu = getUser(ctx.from.id);
+  await bot.telegram.sendMessage(
+    ADMIN_ID,
+    `Новая заявка на доступ\n${fmtUser(nu)}`,
+    adminReqCard(reqId)
+  );
+});
+
+bot.action("get_proxy", async (ctx) => {
+  upsertUser(ctx.from);
+  const u = getUser(ctx.from.id);
+  if (!isApproved(u)) return ctx.answerCbQuery("Нет доступа (или истёк)", { show_alert: true });
+
+  const url = proxyUrl();
+  if (!url) return ctx.answerCbQuery("Прокси временно недоступен (секрет не задан)", { show_alert: true });
+
+  if (u.device_limit > 0 && u.devices_used >= u.device_limit) {
+    return ctx.answerCbQuery("Лимит устройств исчерпан. Попроси апдейт", { show_alert: true });
+  }
+  if (u.devices_used == 0) {
+    db.prepare("UPDATE users SET devices_used = devices_used + 1, updated_at=? WHERE tg_id=?").run(now(), u.tg_id);
+  }
+
+  await ctx.answerCbQuery("Ок");
+  await ctx.reply(
+    `Доступ активен ✅
+
+Нажми кнопку ниже — Telegram откроет окно добавления прокси.
+
+⚠️ Если у тебя включён VPN и ничего не грузит — выключи VPN и включи прокси заново.
+
+${pickPs("accessGranted", ctx.from.id)}` ,
+    Markup.inlineKeyboard([[Markup.button.url("Подключить прокси", url)]])
+  );
+});
+
+bot.action("howto", (ctx) => {
+  ctx.answerCbQuery();
+  ctx.reply(`Как включить прокси вручную:
+
+1) Telegram → Настройки → Данные и память → Прокси
+2) «Добавить прокси» → MTProto
+3) Вставь Server / Port / Secret
+
+${pickPs("howto", ctx.from.id)}`);
+});
+
+bot.action(/approve:(.+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const reqId = ctx.match[1];
+  const req = db.prepare("SELECT * FROM requests WHERE id=?").get(reqId);
+  if (!req || req.status !== "pending") return ctx.answerCbQuery("Уже обработано");
+
+  db.prepare("UPDATE requests SET status=approved WHERE id=?").run(reqId);
+  setUserStatus(req.tg_id, "approved");
+
+  await ctx.answerCbQuery("Ок");
+  await ctx.editMessageText("Принято. Выбери лимит устройств и срок", adminAccessPicker(reqId));
+});
+
+bot.action(/deny:(.+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const reqId = ctx.match[1];
+  const req = db.prepare("SELECT * FROM requests WHERE id=?").get(reqId);
+  if (!req || req.status !== "pending") return ctx.answerCbQuery("Уже обработано");
+
+  db.prepare("UPDATE requests SET status=denied WHERE id=?").run(reqId);
+  setUserStatus(req.tg_id, "denied");
+
+  await ctx.answerCbQuery("Ок");
+  await ctx.editMessageText("Отклонено");
+  try { await bot.telegram.sendMessage(req.tg_id, "Сорри, доступ не выдан"); } catch {}
+});
+
+bot.action(/banreq:(.+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const reqId = ctx.match[1];
+  const req = db.prepare("SELECT * FROM requests WHERE id=?").get(reqId);
+  if (!req) return ctx.answerCbQuery("Не нашла заявку");
+
+  banUser(req.tg_id);
+  db.prepare("UPDATE requests SET status=banned WHERE id=?").run(reqId);
+
+  await ctx.answerCbQuery("Ок");
+  await ctx.editMessageText("Пользователь забанен");
+  try { await bot.telegram.sendMessage(req.tg_id, "Доступ закрыт"); } catch {}
+});
+
+const pendingAccess = new Map(); // reqId -> { deviceLimit, expiresDays }
+
+bot.action(/setdev:(.+):(\d+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const reqId = ctx.match[1];
+  const n = Number(ctx.match[2]);
+  const s = pendingAccess.get(reqId) || { deviceLimit: n, expiresDays: 30 };
+  s.deviceLimit = n;
+  pendingAccess.set(reqId, s);
+  await ctx.answerCbQuery(`Лимит: ${n}`);
+});
+
+bot.action(/setexp:(.+):(\d+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const reqId = ctx.match[1];
+  const d = Number(ctx.match[2]);
+  const s = pendingAccess.get(reqId) || { deviceLimit: 2, expiresDays: d };
+  s.expiresDays = d;
+  pendingAccess.set(reqId, s);
+
+  const req = db.prepare("SELECT * FROM requests WHERE id=?").get(reqId);
+  if (!req) return ctx.answerCbQuery("Не нашла заявку");
+
+  const expiresAt = d == 0 ? null : now() + d * 86400;
+  const deviceLimit = s.deviceLimit ?? 2;
+
+  setUserAccess(req.tg_id, { deviceLimit, expiresAt });
+
+  await ctx.answerCbQuery("Доступ выдан");
+  await ctx.editMessageText(`Доступ выдан: ${deviceLimit} устройств, срок: ${d == 0 ? "Без срока" : str(d) + " дней"}`);
+
+  try {
+    await bot.telegram.sendMessage(
+      req.tg_id,
+      `Доступ выдан ✅\nЛимит устройств: ${deviceLimit}\nСрок: ${d == 0 ? "Без срока" : d + " дней"}\n\nТеперь нажми «/start» или открой меню — появится кнопка «Получить прокси».`
+    );
+  } catch {}
+});
+
+bot.launch();
+process.on("SIGINT", () => bot.stop("SIGINT"));
+process.on("SIGTERM", () => bot.stop("SIGTERM"));
