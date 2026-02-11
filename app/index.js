@@ -313,6 +313,11 @@ function cleanupOldSessions(maxAgeHours = 24) {
   db.prepare("DELETE FROM admin_sessions WHERE updated_at < ?").run(cutoff);
 }
 
+const ADMIN_REPLY_KEYBOARD = Markup.keyboard([
+  ["🔧 Админ-панель", "👥 Клиенты"],
+  ["📋 Заявки", "🛡️ Состояние"]
+]).resize();
+
 // ==================== KEYBOARDS ====================
 
 function userMenu(opts = {}) {
@@ -333,9 +338,10 @@ function userMenu(opts = {}) {
 
 function adminMainMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("📋 Список заявок", "admin_list_requests")],
-    [Markup.button.callback("⏳ Зависшие заявки", "admin_stuck_requests")],
-    [Markup.button.callback("👥 Клиенты", "admin_clients")]
+    [Markup.button.callback("📋 Ожидающие заявки", "admin_list_requests")],
+    [Markup.button.callback("⏳ Зависшие (stuck)", "admin_stuck_requests")],
+    [Markup.button.callback("👥 Управление клиентами", "admin_clients")],
+    [Markup.button.callback("🛡️ Профили и Состояние", "admin_diag")]
   ]);
 }
 
@@ -476,14 +482,9 @@ async function configureBotCommands() {
     // Hide commands globally for regular users
     await bot.telegram.setMyCommands([], { scope: { type: 'default' } });
 
-    // Show extended command menu only in admin chat
+    // Admin commands (minimal, as everything is now on buttons)
     await bot.telegram.setMyCommands([
-      { command: 'admin', description: 'Админ-панель' },
-      { command: 'clients', description: 'Клиенты' },
-      { command: 'diag', description: 'Диагностика режима' },
-      { command: 'turbo', description: 'Быстрый профиль' },
-      { command: 'stable', description: 'Резервный профиль' },
-      { command: 'safe', description: 'Показать оба профиля' }
+      { command: 'admin', description: 'Открыть админ-панель' }
     ], { scope: { type: 'chat', chat_id: ADMIN_ID } });
   } catch (err) {
     console.error('[configureBotCommands]', err?.message || err);
@@ -508,15 +509,73 @@ bot.start(async (ctx) => {
   }
 
   const approved = isApproved(u);
+  const isAdmin = Number(ctx.from.id) === ADMIN_ID;
 
   const startText = approved
     ? `Привет! Доступ уже активен ✅\n\nВыбери режим:\n• ⚡ TURBO — быстрее\n• 🧱 STABLE — надёжнее при плохом маршруте\n\n${pickUniquePs("start", ctx.from.id)}`
     : `Привет! Я помогаю подключиться к прокси, чтобы связь работала стабильно.\n\nКак это работает:\n1) Нажми «Запросить доступ»\n2) Я подтвержу\n\n⚠️ Важно: С включённым VPN MTProto‑прокси часто не работает.\n\n${pickUniquePs("start", ctx.from.id)}`;
 
+  const kb = userMenu({ approved });
+  
+  if (isAdmin) {
+    return await ctx.reply(startText, {
+      reply_markup: {
+        ...kb.reply_markup,
+        ...ADMIN_REPLY_KEYBOARD.reply_markup
+      },
+      parse_mode: "HTML"
+    });
+  }
+
   await renderMenu(ctx, {
     text: startText,
-    keyboard: userMenu({ approved })
+    keyboard: kb
   });
+});
+
+bot.hears("🔧 Админ-панель", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await safeReply(ctx, "🔧 Админ-панель", adminMainMenu());
+});
+
+bot.hears("👥 Клиенты", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await renderAdminClients(ctx, "reply", 1);
+});
+
+bot.hears("📋 Заявки", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  // Trigger list requests logic
+  const pending = db.prepare(`
+    SELECT r.*, u.username, u.first_name, u.last_name 
+    FROM requests r 
+    JOIN users u ON r.tg_id = u.tg_id 
+    WHERE r.status = 'pending' 
+    ORDER BY r.created_at DESC
+  `).all();
+  
+  if (pending.length === 0) {
+    return safeReply(ctx, "✅ Нет ожидающих заявок", adminMainMenu());
+  }
+  
+  let text = `📋 Ожидающие заявки (${pending.length}):\n\n`;
+  const keyboard = { inline_keyboard: [] };
+  
+  for (const req of pending) {
+    const name = `${req.first_name || ""} ${req.last_name || ""}`.trim();
+    const username = req.username ? `@${req.username}` : `id:${req.tg_id}`;
+    const time = new Date(req.created_at * 1000).toLocaleString('ru-RU', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' });
+    text += `• ${name} (${username}) — ${time}\n`;
+    keyboard.inline_keyboard.push([Markup.button.callback(`👤 ${name || username}`, `admin_view_req:${req.id}`)]);
+  }
+  
+  keyboard.inline_keyboard.push([Markup.button.callback("« В меню", "admin_menu")]);
+  await safeReply(ctx, text, { reply_markup: keyboard });
+});
+
+bot.hears("🛡️ Состояние", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await renderAdminDiag(ctx, "reply");
 });
 
 bot.action("req_access", async (ctx) => {
@@ -1264,16 +1323,39 @@ bot.action(/admin_client_revoke:(\d+):(\d+)/, async (ctx) => {
   await renderAdminClients(ctx, "edit", page);
 });
 
+async function renderAdminDiag(ctx, mode = "edit") {
+  const { turboUrl, stableUrl } = buildProxyUrls();
+  const turboPort = String(PROXY_PORT || "443");
+  
+  const text = `🛡️ Состояние и Профили\n\n` +
+    `Текущий сервер: <code>${PROXY_SERVER}</code>\n` +
+    `Турбо-порт: <code>${turboPort}</code>\n\n` +
+    `⚡ TURBO:\n<code>${turboUrl}</code>\n\n` +
+    `🧱 STABLE:\n<code>${stableUrl}</code>\n\n` +
+    `Рекомендация: если видео тупят — пробуй STABLE.`;
+
+  const kb = Markup.inlineKeyboard([
+    [Markup.button.callback("🔄 Обновить", "admin_diag")],
+    [Markup.button.callback("« В меню", "admin_menu")]
+  ]);
+
+  if (mode === "reply") {
+    return safeReply(ctx, text, { reply_markup: kb.reply_markup });
+  }
+  return safeEditMessageText(ctx, text, { reply_markup: kb.reply_markup });
+}
+
+bot.action("admin_diag", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await safeAnswerCbQuery(ctx);
+  await renderAdminDiag(ctx, "edit");
+});
+
 // ==================== COMMANDS ====================
 
 bot.command("admin", async (ctx) => {
   if (!requireAdmin(ctx)) return;
   await safeReply(ctx, "🔧 Админ-панель", adminMainMenu());
-});
-
-bot.command("clients", async (ctx) => {
-  if (!requireAdmin(ctx)) return;
-  await renderAdminClients(ctx, "reply");
 });
 
 function buildProxyUrls() {
