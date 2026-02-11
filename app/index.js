@@ -335,7 +335,8 @@ function adminMainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("📋 Список заявок", "admin_list_requests")],
     [Markup.button.callback("⏳ Зависшие заявки", "admin_stuck_requests")],
-    [Markup.button.callback("📊 Статистика", "admin_stats")]
+    [Markup.button.callback("📊 Статистика", "admin_stats")],
+    [Markup.button.callback("👥 Клиенты сейчас", "admin_clients")]
   ]);
 }
 
@@ -480,6 +481,7 @@ async function configureBotCommands() {
     await bot.telegram.setMyCommands([
       { command: 'admin', description: 'Админ-панель' },
       { command: 'stats', description: 'Статистика' },
+      { command: 'clients', description: 'Клиенты сейчас' },
       { command: 'diag', description: 'Диагностика режима' },
       { command: 'turbo', description: 'Быстрый профиль' },
       { command: 'stable', description: 'Резервный профиль' },
@@ -1107,6 +1109,60 @@ bot.action(/admin_reopen:(.+)/, async (ctx) => {
   await safeSendMessage(bot, req.tg_id, "Твоя зависшая заявка была переоткрыта. Жди подтверждения ✅");
 });
 
+function formatClientName(u) {
+  const name = `${u.first_name || ""} ${u.last_name || ""}`.trim();
+  return name || (u.username ? `@${u.username}` : `id:${u.tg_id}`);
+}
+
+async function renderAdminClients(ctx, mode = "edit") {
+  const users = db.prepare(`
+    SELECT tg_id, username, first_name, last_name, status, device_limit, devices_used, expires_at, updated_at
+    FROM users
+    WHERE status='approved'
+    ORDER BY updated_at DESC
+    LIMIT 100
+  `).all();
+
+  const active = users.filter(u => !u.expires_at || u.expires_at > now());
+  const expired = users.length - active.length;
+
+  let text = `👥 Клиенты сейчас\n\n✅ Активных: ${active.length}\n⌛ Истекших: ${expired}\n\n`;
+
+  if (!users.length) {
+    text += "Пока нет одобренных клиентов";
+    if (mode === "reply") {
+      return safeReply(ctx, text, adminMainMenu());
+    }
+    return safeEditMessageText(ctx, text, { reply_markup: adminMainMenu().reply_markup });
+  }
+
+  const rows = [];
+  for (const u of users) {
+    const isActive = !u.expires_at || u.expires_at > now();
+    const icon = isActive ? "✅" : "⌛";
+    const username = u.username ? `@${u.username}` : "без username";
+    const expText = u.expires_at ? new Date(u.expires_at * 1000).toLocaleDateString('ru-RU') : "без срока";
+    const limText = u.device_limit === 0 ? "∞" : String(u.device_limit || 0);
+
+    text += `${icon} ${formatClientName(u)} (${username})\n`;
+    text += `   устр: ${u.devices_used}/${limText} • срок: ${expText}\n`;
+
+    if (u.username) {
+      rows.push([Markup.button.url(`${icon} ${username}`, `https://t.me/${u.username}`)]);
+    } else {
+      rows.push([Markup.button.url(`${icon} id:${u.tg_id}`, `tg://user?id=${u.tg_id}`)]);
+    }
+  }
+
+  rows.push([Markup.button.callback("🔄 Обновить", "admin_clients")]);
+  rows.push([Markup.button.callback("« В меню", "admin_menu")]);
+
+  if (mode === "reply") {
+    return safeReply(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
+  }
+  return safeEditMessageText(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
+}
+
 // Stats
 bot.action("admin_stats", async (ctx) => {
   if (!requireAdmin(ctx)) return;
@@ -1126,6 +1182,7 @@ bot.action("admin_stats", async (ctx) => {
 
   const keyboard = Markup.inlineKeyboard([
     [Markup.button.callback("👥 Юзернеймы и профили", "admin_stats_users")],
+    [Markup.button.callback("👥 Клиенты сейчас", "admin_clients")],
     [Markup.button.callback("« В меню", "admin_menu")]
   ]);
   
@@ -1167,6 +1224,12 @@ bot.action("admin_stats_users", async (ctx) => {
   await safeEditMessageText(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
 });
 
+bot.action("admin_clients", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await safeAnswerCbQuery(ctx);
+  await renderAdminClients(ctx, "edit");
+});
+
 // ==================== COMMANDS ====================
 
 bot.command("admin", async (ctx) => {
@@ -1181,6 +1244,11 @@ bot.command("stats", async (ctx) => {
   const pending = db.prepare("SELECT COUNT(*) as count FROM requests WHERE status='pending'").get().count;
   
   await safeReply(ctx, `📊 Статистика:\nВсего пользователей: ${total}\nАктивных доступов: ${approved}\nОжидают проверки: ${pending}`);
+});
+
+bot.command("clients", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await renderAdminClients(ctx, "reply");
 });
 
 function buildProxyUrls() {
