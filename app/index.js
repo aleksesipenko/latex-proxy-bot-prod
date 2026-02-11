@@ -335,8 +335,7 @@ function adminMainMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("📋 Список заявок", "admin_list_requests")],
     [Markup.button.callback("⏳ Зависшие заявки", "admin_stuck_requests")],
-    [Markup.button.callback("📊 Статистика", "admin_stats")],
-    [Markup.button.callback("👥 Клиенты сейчас", "admin_clients")]
+    [Markup.button.callback("👥 Клиенты", "admin_clients")]
   ]);
 }
 
@@ -480,8 +479,7 @@ async function configureBotCommands() {
     // Show extended command menu only in admin chat
     await bot.telegram.setMyCommands([
       { command: 'admin', description: 'Админ-панель' },
-      { command: 'stats', description: 'Статистика' },
-      { command: 'clients', description: 'Клиенты сейчас' },
+      { command: 'clients', description: 'Клиенты' },
       { command: 'diag', description: 'Диагностика режима' },
       { command: 'turbo', description: 'Быстрый профиль' },
       { command: 'stable', description: 'Резервный профиль' },
@@ -1114,26 +1112,37 @@ function formatClientName(u) {
   return name || (u.username ? `@${u.username}` : `id:${u.tg_id}`);
 }
 
+function fmtExpiry(expiresAt) {
+  if (!expiresAt) return "без срока";
+  const left = Math.ceil((expiresAt - now()) / 86400);
+  const d = new Date(expiresAt * 1000).toLocaleDateString('ru-RU');
+  return `${d} (${left} дн.)`;
+}
+
+function updateClientPolicy(tgId, { deviceLimit, expiresDays }) {
+  const expiresAt = expiresDays === 0 ? null : now() + expiresDays * 86400;
+  db.prepare("UPDATE users SET status='approved', device_limit=?, expires_at=?, updated_at=? WHERE tg_id=?")
+    .run(deviceLimit, expiresAt, now(), tgId);
+}
+
 async function renderAdminClients(ctx, mode = "edit", page = 1) {
-  const PAGE_SIZE = 8;
+  const PAGE_SIZE = 5;
   const users = db.prepare(`
     SELECT tg_id, username, first_name, last_name, status, device_limit, devices_used, expires_at, updated_at
     FROM users
     WHERE status='approved'
     ORDER BY updated_at DESC
-    LIMIT 200
+    LIMIT 300
   `).all();
 
   const active = users.filter(u => !u.expires_at || u.expires_at > now());
   const expired = users.length - active.length;
 
-  let text = `👥 Клиенты сейчас\n\n✅ Активных: ${active.length}\n⌛ Истекших: ${expired}\n\n`;
+  let text = `👥 Клиенты\n\n✅ Активных: ${active.length}\n⌛ Истекших: ${expired}\n`;
 
   if (!users.length) {
-    text += "Пока нет одобренных клиентов";
-    if (mode === "reply") {
-      return safeReply(ctx, text, adminMainMenu());
-    }
+    text += "\n\nПока нет одобренных клиентов";
+    if (mode === "reply") return safeReply(ctx, text, adminMainMenu());
     return safeEditMessageText(ctx, text, { reply_markup: adminMainMenu().reply_markup });
   }
 
@@ -1142,99 +1151,64 @@ async function renderAdminClients(ctx, mode = "edit", page = 1) {
   const start = (safePage - 1) * PAGE_SIZE;
   const pageUsers = users.slice(start, start + PAGE_SIZE);
 
-  text += `Страница ${safePage}/${totalPages}\n\n`;
+  text += `\n\nСтраница ${safePage}/${totalPages}\nВыбери клиента ниже`;
 
-  for (const u of pageUsers) {
-    const isActive = !u.expires_at || u.expires_at > now();
-    const icon = isActive ? "✅" : "⌛";
+  const rows = pageUsers.map((u) => {
+    const icon = (!u.expires_at || u.expires_at > now()) ? "✅" : "⌛";
     const username = u.username ? `@${u.username}` : `id:${u.tg_id}`;
-    const expText = u.expires_at ? new Date(u.expires_at * 1000).toLocaleDateString('ru-RU') : "без срока";
-    const limText = u.device_limit === 0 ? "∞" : String(u.device_limit || 0);
+    const short = username.length > 26 ? `${username.slice(0, 26)}…` : username;
+    return [Markup.button.callback(`${icon} ${short}`, `admin_client:${u.tg_id}:${safePage}`)];
+  });
 
-    text += `${icon} ${formatClientName(u)} (${username})\n`;
-    text += `   устр: ${u.devices_used}/${limText} • срок: ${expText}\n`;
-  }
-
-  const rows = [];
   const nav = [];
-  if (safePage > 1) nav.push(Markup.button.callback("⬅️ Назад", `admin_clients_page:${safePage - 1}`));
-  if (safePage < totalPages) nav.push(Markup.button.callback("Вперёд ➡️", `admin_clients_page:${safePage + 1}`));
-  if (nav.length) rows.push(nav);
-
+  if (safePage > 1) nav.push(Markup.button.callback("⬅️", `admin_clients_page:${safePage - 1}`));
+  nav.push(Markup.button.callback(`${safePage}/${totalPages}`, "admin_clients_noop"));
+  if (safePage < totalPages) nav.push(Markup.button.callback("➡️", `admin_clients_page:${safePage + 1}`));
+  rows.push(nav);
   rows.push([Markup.button.callback("🔄 Обновить", `admin_clients_page:${safePage}`)]);
   rows.push([Markup.button.callback("« В меню", "admin_menu")]);
 
-  if (mode === "reply") {
-    return safeReply(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
-  }
+  if (mode === "reply") return safeReply(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
   return safeEditMessageText(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
 }
 
-// Stats
-bot.action("admin_stats", async (ctx) => {
-  if (!requireAdmin(ctx)) return;
-  await safeAnswerCbQuery(ctx);
-  
-  const total = db.prepare("SELECT COUNT(*) as count FROM users").get().count;
-  const approved = db.prepare("SELECT COUNT(*) as count FROM users WHERE status='approved'").get().count;
-  const pending = db.prepare("SELECT COUNT(*) as count FROM requests WHERE status='pending'").get().count;
-  const banned = db.prepare("SELECT COUNT(*) as count FROM users WHERE status='banned'").get().count;
-  const denied = db.prepare("SELECT COUNT(*) as count FROM users WHERE status='denied'").get().count;
-  
-  // Expiring soon (within 7 days)
-  const weekFromNow = now() + 7 * 86400;
-  const expiringSoon = db.prepare("SELECT COUNT(*) as count FROM users WHERE status='approved' AND expires_at > ? AND expires_at < ?").get(now(), weekFromNow).count;
-  
-  const text = `📊 Статистика:\n\n👥 Всего пользователей: ${total}\n✅ Активных доступов: ${approved}\n⏳ Ожидают проверки: ${pending}\n❌ Отклонено: ${denied}\n🚫 Забанено: ${banned}\n\n⚠️ Истекает в течение 7 дней: ${expiringSoon}`;
+async function renderAdminClientCard(ctx, tgId, page = 1) {
+  const u = getUser(tgId);
+  if (!u) return safeEditMessageText(ctx, "Пользователь не найден", { reply_markup: adminMainMenu().reply_markup });
 
-  const keyboard = Markup.inlineKeyboard([
-    [Markup.button.callback("👥 Юзернеймы и профили", "admin_stats_users")],
-    [Markup.button.callback("👥 Клиенты сейчас", "admin_clients")],
-    [Markup.button.callback("« В меню", "admin_menu")]
+  const text = `👤 Клиент\n\n${fmtUser(u)}\nСтатус: ${u.status}\nУстройства: ${u.devices_used}/${u.device_limit === 0 ? '∞' : (u.device_limit || 0)}\nСрок: ${fmtExpiry(u.expires_at)}`;
+
+  const kb = Markup.inlineKeyboard([
+    [
+      Markup.button.callback("Лимит 1", `admin_client_dev:${u.tg_id}:1:${page}`),
+      Markup.button.callback("Лимит 3", `admin_client_dev:${u.tg_id}:3:${page}`),
+      Markup.button.callback("Лимит 5", `admin_client_dev:${u.tg_id}:5:${page}`)
+    ],
+    [
+      Markup.button.callback("∞ устройств", `admin_client_dev:${u.tg_id}:0:${page}`)
+    ],
+    [
+      Markup.button.callback("Срок 30д", `admin_client_exp:${u.tg_id}:30:${page}`),
+      Markup.button.callback("Срок 90д", `admin_client_exp:${u.tg_id}:90:${page}`),
+      Markup.button.callback("Без срока", `admin_client_exp:${u.tg_id}:0:${page}`)
+    ],
+    [Markup.button.callback("🚫 Отключить доступ", `admin_client_revoke:${u.tg_id}:${page}`)],
+    [Markup.button.callback("« К клиентам", `admin_clients_page:${page}`)]
   ]);
-  
-  await safeEditMessageText(ctx, text, { reply_markup: keyboard.reply_markup });
-});
 
-bot.action("admin_stats_users", async (ctx) => {
-  if (!requireAdmin(ctx)) return;
-  await safeAnswerCbQuery(ctx);
+  await safeEditMessageText(ctx, text, { reply_markup: kb.reply_markup });
+}
 
-  const users = db.prepare(`
-    SELECT tg_id, username, first_name, last_name, status
-    FROM users
-    ORDER BY updated_at DESC
-    LIMIT 80
-  `).all();
-
-  if (!users.length) {
-    return safeEditMessageText(ctx, "Пользователи пока не найдены", { reply_markup: adminMainMenu().reply_markup });
-  }
-
-  let text = `👥 Пользователи (последние ${users.length})\nНажми кнопку — откроется профиль в Telegram\n\n`;
-  const rows = [];
-
-  for (const u of users) {
-    const name = `${u.first_name || ""} ${u.last_name || ""}`.trim() || `id:${u.tg_id}`;
-    const username = u.username ? `@${u.username}` : "без username";
-    const emoji = u.status === 'approved' ? '✅' : (u.status === 'pending' ? '⏳' : '•');
-    text += `${emoji} ${name} (${username})\n`;
-
-    if (u.username) {
-      rows.push([Markup.button.url(`${emoji} ${username}`, `https://t.me/${u.username}`)]);
-    } else {
-      rows.push([Markup.button.url(`${emoji} ${name}`, `tg://user?id=${u.tg_id}`)]);
-    }
-  }
-
-  rows.push([Markup.button.callback("« Назад к статистике", "admin_stats")]);
-  await safeEditMessageText(ctx, text, { reply_markup: Markup.inlineKeyboard(rows).reply_markup });
-});
 
 bot.action("admin_clients", async (ctx) => {
   if (!requireAdmin(ctx)) return;
   await safeAnswerCbQuery(ctx);
   await renderAdminClients(ctx, "edit", 1);
+});
+
+bot.action("admin_clients_noop", async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  await safeAnswerCbQuery(ctx);
 });
 
 bot.action(/admin_clients_page:(\d+)/, async (ctx) => {
@@ -1244,20 +1218,57 @@ bot.action(/admin_clients_page:(\d+)/, async (ctx) => {
   await renderAdminClients(ctx, "edit", page);
 });
 
+bot.action(/admin_client:(\d+):(\d+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const tgId = Number(ctx.match[1]);
+  const page = Number(ctx.match[2] || 1);
+  await safeAnswerCbQuery(ctx);
+  await renderAdminClientCard(ctx, tgId, page);
+});
+
+bot.action(/admin_client_dev:(\d+):(\d+):(\d+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const tgId = Number(ctx.match[1]);
+  const deviceLimit = Number(ctx.match[2]);
+  const page = Number(ctx.match[3] || 1);
+  const u = getUser(tgId);
+  if (!u || u.status !== 'approved') return safeAnswerCbQuery(ctx, "Клиент не найден");
+
+  const expiresDays = u.expires_at ? Math.max(1, Math.ceil((u.expires_at - now()) / 86400)) : 0;
+  updateClientPolicy(tgId, { deviceLimit, expiresDays });
+  await safeAnswerCbQuery(ctx, `Лимит: ${deviceLimit === 0 ? '∞' : deviceLimit}`);
+  await renderAdminClientCard(ctx, tgId, page);
+});
+
+bot.action(/admin_client_exp:(\d+):(\d+):(\d+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const tgId = Number(ctx.match[1]);
+  const expiresDays = Number(ctx.match[2]);
+  const page = Number(ctx.match[3] || 1);
+  const u = getUser(tgId);
+  if (!u || u.status !== 'approved') return safeAnswerCbQuery(ctx, "Клиент не найден");
+
+  const deviceLimit = u.device_limit ?? 5;
+  updateClientPolicy(tgId, { deviceLimit, expiresDays });
+  await safeAnswerCbQuery(ctx, `Срок: ${expiresDays === 0 ? 'без срока' : `${expiresDays}д`}`);
+  await renderAdminClientCard(ctx, tgId, page);
+});
+
+bot.action(/admin_client_revoke:(\d+):(\d+)/, async (ctx) => {
+  if (!requireAdmin(ctx)) return;
+  const tgId = Number(ctx.match[1]);
+  const page = Number(ctx.match[2] || 1);
+  revokeUser(tgId);
+  await safeAnswerCbQuery(ctx, "Доступ отключён");
+  await safeSendMessage(bot, tgId, "Твой доступ отключен администратором");
+  await renderAdminClients(ctx, "edit", page);
+});
+
 // ==================== COMMANDS ====================
 
 bot.command("admin", async (ctx) => {
   if (!requireAdmin(ctx)) return;
   await safeReply(ctx, "🔧 Админ-панель", adminMainMenu());
-});
-
-bot.command("stats", async (ctx) => {
-  if (!requireAdmin(ctx)) return;
-  const total = db.prepare("SELECT COUNT(*) as count FROM users").get().count;
-  const approved = db.prepare("SELECT COUNT(*) as count FROM users WHERE status='approved'").get().count;
-  const pending = db.prepare("SELECT COUNT(*) as count FROM requests WHERE status='pending'").get().count;
-  
-  await safeReply(ctx, `📊 Статистика:\nВсего пользователей: ${total}\nАктивных доступов: ${approved}\nОжидают проверки: ${pending}`);
 });
 
 bot.command("clients", async (ctx) => {
